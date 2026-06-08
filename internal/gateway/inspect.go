@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/defenseclaw/defenseclaw/internal/audit"
 	"github.com/defenseclaw/defenseclaw/internal/redaction"
 	"github.com/defenseclaw/defenseclaw/internal/scanner"
 	"github.com/defenseclaw/defenseclaw/internal/telemetry"
@@ -66,6 +67,11 @@ type ToolInspectRequest struct {
 	Direction       string          `json:"direction,omitempty"`
 	SessionID       string          `json:"session_id,omitempty"`
 	ApprovalSurface string          `json:"approval_surface,omitempty"`
+	// Connector selects which connector's rule set the scan uses. The hook
+	// handlers stamp it (codex/claudecode/...) so each connector scans
+	// against its own EffectiveRulePackDir. Empty ⇒ process-global default
+	// set (single-connector installs and the generic inspect endpoint).
+	Connector string `json:"connector,omitempty"`
 }
 
 // ToolInspectVerdict is the response from the inspect endpoint.
@@ -275,7 +281,9 @@ func (a *APIServer) inspectToolPolicy(req *ToolInspectRequest) *ToolInspectVerdi
 	argsStr := string(req.Args)
 	toolName := req.Tool
 
-	ruleFindings := ScanAllRules(argsStr, toolName)
+	// Scan against the request connector's rule set so each connector
+	// enforces its own pack (empty ⇒ process-global default set).
+	ruleFindings := ScanAllRulesForConnector(req.Connector, argsStr, toolName)
 
 	// CodeGuard: scan file content for write_file/edit_file tools.
 	tool := strings.ToLower(toolName)
@@ -309,7 +317,7 @@ func (a *APIServer) inspectToolPolicy(req *ToolInspectRequest) *ToolInspectVerdi
 		}
 	}
 
-	action := guardrailRuntimeAction(a.scannerCfg, severity, true)
+	action := guardrailRuntimeActionForConnector(a.scannerCfg, req.Connector, severity, true)
 
 	reasons := make([]string, 0, minInt(len(ruleFindings), 5))
 	for i, f := range ruleFindings {
@@ -393,8 +401,10 @@ func (a *APIServer) inspectMessageContent(req *ToolInspectRequest) *ToolInspectV
 		return &ToolInspectVerdict{Action: "allow", Severity: "NONE", Findings: []string{}}
 	}
 
-	// Outbound messages get the full scan — tool name "message" for context
-	ruleFindings := ScanAllRules(content, "message")
+	// Outbound messages get the full scan — tool name "message" for context.
+	// Routed through the request's connector so each connector scans against
+	// its own rule pack (empty ⇒ process-global default set).
+	ruleFindings := ScanAllRulesForConnector(req.Connector, content, "message")
 
 	if len(ruleFindings) == 0 {
 		// Regex found nothing locally. Give the AID lane a turn —
@@ -409,7 +419,7 @@ func (a *APIServer) inspectMessageContent(req *ToolInspectRequest) *ToolInspectV
 	severity := HighestSeverity(ruleFindings)
 	confidence := HighestConfidence(ruleFindings, severity)
 
-	action := guardrailRuntimeAction(a.scannerCfg, severity, strings.EqualFold(req.Direction, "outbound"))
+	action := guardrailRuntimeActionForConnector(a.scannerCfg, req.Connector, severity, strings.EqualFold(req.Direction, "outbound"))
 
 	reasons := make([]string, 0, minInt(len(ruleFindings), 5))
 	for i, f := range ruleFindings {
@@ -522,13 +532,13 @@ func (a *APIServer) handleInspectTool(w http.ResponseWriter, r *http.Request) {
 	var auditAction string
 	switch verdict.Action {
 	case "block":
-		auditAction = "inspect-tool-block"
+		auditAction = string(audit.ActionInspectToolBlock)
 	case "confirm":
-		auditAction = "inspect-tool-confirm"
+		auditAction = string(audit.ActionInspectToolConfirm)
 	case "alert":
-		auditAction = "inspect-tool-alert"
+		auditAction = string(audit.ActionInspectToolAlert)
 	default:
-		auditAction = "inspect-tool-allow"
+		auditAction = string(audit.ActionInspectToolAllow)
 	}
 	if a.otel != nil {
 		elapsedMs := float64(elapsed.Milliseconds())
@@ -544,6 +554,21 @@ func (a *APIServer) handleInspectTool(w http.ResponseWriter, r *http.Request) {
 		_ = a.otel.EmitInspectSpan(context.Background(), req.Tool, verdict.Action, verdict.Severity, elapsedMs)
 	}
 
+	targetType := "tool_call"
+	if strings.ToLower(req.Tool) == "message" {
+		switch strings.ToLower(req.Direction) {
+		case "completion", "outbound", "response":
+			targetType = "completion"
+		case "tool_result", "tool-response":
+			targetType = "tool_response"
+		default:
+			targetType = "prompt"
+		}
+	}
+	evalCtx := a.emitInspectVerdictFindings(r.Context(), "inspect-http",
+		"/api/v1/inspect/tool:"+req.Tool, targetType, verdict, elapsed,
+		"emit_inspect_tool")
+
 	requestID := RequestIDFromContext(r.Context())
 	auditDetails := fmt.Sprintf("severity=%s confidence=%.2f reason=%s elapsed=%s mode=%s would_block=%v raw_action=%s",
 		verdict.Severity, verdict.Confidence, verdict.Reason, elapsed, verdict.Mode, verdict.WouldBlock, verdict.RawAction)
@@ -556,6 +581,7 @@ func (a *APIServer) handleInspectTool(w http.ResponseWriter, r *http.Request) {
 	if requestID != "" {
 		auditDetails += fmt.Sprintf(" request_id=%s", requestID)
 	}
+	auditDetails = appendHookEvaluationDetails(auditDetails, evalCtx)
 	_ = a.logger.LogActionCtx(r.Context(), auditAction, req.Tool, auditDetails)
 
 	a.emitCodeGuardOTel(&req, verdict, elapsed)
@@ -574,7 +600,7 @@ func (a *APIServer) handleInspectTool(w http.ResponseWriter, r *http.Request) {
 		// when the caller opts in to raw response PII, the
 		// audit-store row must still flow through the sink
 		// barrier so SQLite/Splunk never see the raw literal.
-		_ = a.logger.LogActionCtx(r.Context(), "inspect-reveal", req.Tool,
+		_ = a.logger.LogActionCtx(r.Context(), string(audit.ActionInspectReveal), req.Tool,
 			fmt.Sprintf("severity=%s remote=%s reason=%s",
 				verdict.Severity, r.RemoteAddr,
 				redaction.ForSinkReason(verdict.Reason)))

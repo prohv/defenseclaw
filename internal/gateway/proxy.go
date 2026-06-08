@@ -127,6 +127,13 @@ type GuardrailProxy struct {
 	registry  *connector.Registry
 	setupOpts connector.SetupOpts
 
+	// hookGuard auto-heals the active connector's agent config file when
+	// a user manually deletes the DefenseClaw hook block while the
+	// gateway is running. nil when guardrail.hook_self_heal is disabled.
+	// Repointed on runtime connector switch so it follows the active
+	// connector.
+	hookGuard *HookConfigGuard
+
 	// Observability defaults set at bootstrap. defaultAgentName
 	// falls back to cfg.Claw.Mode ("openclaw") when the request
 	// does not carry an agent identifier; defaultPolicyID is the
@@ -252,7 +259,8 @@ func (p *GuardrailProxy) resolveConfirm(ctx context.Context, r *http.Request, ve
 		return
 	}
 
-	approved, status, err := p.hilt.Request(ctx, hiltSessionID(ctx, r), subject, verdict.Severity, verdict.Reason, 0)
+	approved, status, err := p.hilt.Request(ctx, hiltSessionID(ctx, r), subject, verdict.Severity, verdict.Reason, 0,
+		HILTApprovalContext{EvaluationID: verdict.EvaluationID, RuleIDs: verdict.RuleIDs})
 	if approved {
 		verdict.Action = guardrailActionAllow
 		verdict.Reason = appendVerdictReason(verdict.Reason, "human approved once")
@@ -362,6 +370,11 @@ func NewGuardrailProxy(
 	// over `data.guardrail.hilt` (the data path is preserved as a fallback
 	// for non-gateway callers like direct `opa eval` runs).
 	inspector.SetHILTConfig(cfg.HILT.Enabled, cfg.HILT.MinSeverity)
+	if otel != nil {
+		inspector.SetPanicRecorderFunc(func(ctx context.Context) {
+			otel.RecordPanic(ctx, gatewaylog.SubsystemGuardrail)
+		})
+	}
 	// Wire OTel span emission when telemetry is enabled. The
 	// inspector only sees a closure, so the telemetry dep stays
 	// localized to the proxy wiring layer.
@@ -427,6 +440,45 @@ func NewGuardrailProxy(
 func (p *GuardrailProxy) SetConnectorSwitchState(reg *connector.Registry, opts connector.SetupOpts) {
 	p.registry = reg
 	p.setupOpts = opts
+}
+
+// StartHookConfigGuard launches the connector hook self-heal guard bound to
+// ctx. It must be called after the connector's initial Setup so the watched
+// config files already exist. The guard is owned by the proxy and repointed on
+// runtime connector switch. The guard goroutine stops when ctx is cancelled.
+//
+// Started for both proxy-bound and observability-only connectors: hook-native
+// connectors (codex, claudecode, cursor, ...) never reach proxy.Run, so the
+// caller (runGuardrail) is responsible for invoking this before the
+// observability short-circuit.
+func (p *GuardrailProxy) StartHookConfigGuard(ctx context.Context, conn connector.Connector, opts connector.SetupOpts) {
+	if p == nil {
+		return
+	}
+	debounce := time.Duration(p.cfg.HookSelfHealDebounceMs) * time.Millisecond
+	guard := NewHookConfigGuard(p.logger, p.otel, debounce)
+	guard.SetHealNotifier(p.notifyHookHealed)
+	p.hookGuard = guard
+	guard.Start(ctx, conn, opts)
+}
+
+// notifyHookHealed fans a successful hook re-install out to the configured
+// webhook endpoints, mirroring the watchdog health-event path. The durable
+// audit row and OTel metric are emitted by the guard itself; this adds the
+// outbound notifier channel so operators learn that a connector hook was
+// tampered with and restored.
+func (p *GuardrailProxy) notifyHookHealed(connectorName string, paths []string) {
+	if p == nil || p.webhooks == nil {
+		return
+	}
+	p.webhooks.Dispatch(audit.Event{
+		Timestamp: time.Now().UTC(),
+		Action:    string(audit.ActionConnectorHookRepaired),
+		Target:    connectorName,
+		Actor:     "defenseclaw-hook-guard",
+		Details:   fmt.Sprintf("re-installed connector hook config after manual removal: %s", strings.Join(paths, ", ")),
+		Severity:  "HIGH",
+	})
 }
 
 // SetWebhookDispatcher attaches a webhook dispatcher for guardrail block notifications.
@@ -499,7 +551,7 @@ func (p *GuardrailProxy) Run(ctx context.Context) error {
 	})
 	fmt.Fprintf(os.Stderr, "[guardrail] starting proxy (addr=%s mode=%s model=%s)\n",
 		addr, p.mode, p.cfg.ModelName)
-	_ = p.logger.LogAction("guardrail-start", "",
+	_ = p.logger.LogAction(string(audit.ActionGuardrailStart), "",
 		fmt.Sprintf("port=%d mode=%s model=%s", p.cfg.Port, p.mode, p.cfg.ModelName))
 	emitLifecycle(ctx, "guardrail", "start", map[string]string{
 		"port":  fmt.Sprintf("%d", p.cfg.Port),
@@ -525,7 +577,7 @@ func (p *GuardrailProxy) Run(ctx context.Context) error {
 			"addr": addr,
 		})
 		fmt.Fprintf(os.Stderr, "[guardrail] proxy ready on %s\n", addr)
-		_ = p.logger.LogAction("guardrail-healthy", "", fmt.Sprintf("port=%d", p.cfg.Port))
+		_ = p.logger.LogAction(string(audit.ActionGuardrailHealthy), "", fmt.Sprintf("port=%d", p.cfg.Port))
 		emitLifecycle(ctx, "guardrail", "ready", map[string]string{
 			"port": fmt.Sprintf("%d", p.cfg.Port),
 		})
@@ -990,7 +1042,7 @@ func (p *GuardrailProxy) handlePassthrough(w http.ResponseWriter, r *http.Reques
 		fmt.Fprintf(os.Stderr, "[guardrail] laundered %d DefenseClaw block turn(s) from passthrough history (path=%s)\n", stripped, r.URL.Path)
 		body = []byte(launderedBody)
 		if p.logger != nil {
-			_ = p.logger.LogActionCtx(r.Context(), "guardrail-launder", r.URL.Path, fmt.Sprintf("stripped %d stale DefenseClaw block turn(s) from request history", stripped))
+			_ = p.logger.LogActionCtx(r.Context(), string(audit.ActionGuardrailLaunder), r.URL.Path, fmt.Sprintf("stripped %d stale DefenseClaw block turn(s) from request history", stripped))
 		}
 	}
 
@@ -1011,7 +1063,7 @@ func (p *GuardrailProxy) handlePassthrough(w http.ResponseWriter, r *http.Reques
 				fmt.Fprintf(os.Stderr, "[guardrail] injecting security notification into passthrough request (site=%s path=%s)\n", site, r.URL.Path)
 				body = []byte(patched)
 				if p.logger != nil {
-					_ = p.logger.LogActionCtx(r.Context(), "guardrail-notify-inject", site, "injected security notification into passthrough LLM request")
+					_ = p.logger.LogActionCtx(r.Context(), string(audit.ActionGuardrailNotifyInject), site, "injected security notification into passthrough LLM request")
 				}
 			} else {
 				// Not a failure: some provider surfaces (Anthropic,
@@ -2026,7 +2078,7 @@ func (p *GuardrailProxy) handleChatCompletion(w http.ResponseWriter, r *http.Req
 				req.Messages = rebuilt.Messages
 			}
 			if p.logger != nil {
-				_ = p.logger.LogActionCtx(r.Context(), "guardrail-launder", r.URL.Path, fmt.Sprintf("stripped %d stale DefenseClaw block turn(s) from chat-completions request", stripped))
+				_ = p.logger.LogActionCtx(r.Context(), string(audit.ActionGuardrailLaunder), r.URL.Path, fmt.Sprintf("stripped %d stale DefenseClaw block turn(s) from chat-completions request", stripped))
 			}
 		}
 	}
@@ -2049,7 +2101,7 @@ func (p *GuardrailProxy) handleChatCompletion(w http.ResponseWriter, r *http.Req
 				req.Messages = append([]ChatMessage{notification}, req.Messages...)
 			}
 			if p.logger != nil {
-				_ = p.logger.LogActionCtx(r.Context(), "guardrail-notify-inject", "", "injected security notification into LLM request")
+				_ = p.logger.LogActionCtx(r.Context(), string(audit.ActionGuardrailNotifyInject), "", "injected security notification into LLM request")
 			}
 		}
 	}
@@ -2723,12 +2775,14 @@ func (p *GuardrailProxy) enqueueBlockNotification(verdict *ScanVerdict, directio
 	// dispatcher applies its own per-category gate, dedup window,
 	// and rate limit before delivery.
 	p.notifier.OnBlock(notifier.BlockEvent{
-		Source:    notifier.SourceGuardrail,
-		Target:    model,
-		Reason:    string(redaction.ForSinkReason(verdict.Reason)),
-		Severity:  verdict.Severity,
-		Connector: p.connectorName(),
-		Event:     direction,
+		Source:       notifier.SourceGuardrail,
+		Target:       model,
+		Reason:       string(redaction.ForSinkReason(verdict.Reason)),
+		Severity:     verdict.Severity,
+		Connector:    p.connectorName(),
+		Event:        direction,
+		EvaluationID: verdict.EvaluationID,
+		RuleIDs:      verdict.RuleIDs,
 	})
 }
 
@@ -2745,12 +2799,14 @@ func (p *GuardrailProxy) enqueueWouldBlockNotification(verdict *ScanVerdict, dir
 		return
 	}
 	p.notifier.OnWouldBlock(notifier.BlockEvent{
-		Source:    notifier.SourceGuardrail,
-		Target:    model,
-		Reason:    string(redaction.ForSinkReason(verdict.Reason)),
-		Severity:  verdict.Severity,
-		Connector: p.connectorName(),
-		Event:     direction,
+		Source:       notifier.SourceGuardrail,
+		Target:       model,
+		Reason:       string(redaction.ForSinkReason(verdict.Reason)),
+		Severity:     verdict.Severity,
+		Connector:    p.connectorName(),
+		Event:        direction,
+		EvaluationID: verdict.EvaluationID,
+		RuleIDs:      verdict.RuleIDs,
 	})
 }
 
@@ -3458,6 +3514,13 @@ func (p *GuardrailProxy) switchConnectorLocked(newName string) {
 
 	newConn.SetCredentials(p.gatewayToken, p.masterKey)
 
+	// Pause self-heal across the swap. Teardown below strips the outgoing
+	// connector's hook entries, which must NOT be auto-restored; without
+	// this the guard (still pointed at oldConn until Repoint) could race the
+	// teardown and re-install hooks for a connector we just deactivated.
+	// Repoint at the end re-targets the guard at newConn.
+	p.hookGuard.SuppressHealing(hookGuardSwitchSuppressWindow)
+
 	if oldConn != nil {
 		fmt.Fprintf(os.Stderr, "[guardrail] runtime connector switch: tearing down %s\n", oldConn.Name())
 		if err := oldConn.Teardown(ctx, p.setupOpts); err != nil {
@@ -3483,6 +3546,10 @@ func (p *GuardrailProxy) switchConnectorLocked(newName string) {
 	if err := connector.SaveActiveConnector(p.setupOpts.DataDir, newName); err != nil {
 		fmt.Fprintf(os.Stderr, "[guardrail] save active connector state: %v\n", err)
 	}
+
+	// Follow the active connector so self-heal watches the new
+	// connector's config file rather than the torn-down one's.
+	p.hookGuard.Repoint(newConn, p.setupOpts)
 
 	if p.health != nil {
 		p.health.SetConnector(newConn.Name(), newConn.ToolInspectionMode(), newConn.SubprocessPolicy())
@@ -3763,6 +3830,42 @@ func (p *GuardrailProxy) recordTelemetry(ctx context.Context, direction, model s
 		}
 		details += fmt.Sprintf(" canonical=%s", strings.Join(ids, ","))
 	}
+
+	// Fan the verdict's findings through the unified scanner
+	// emission pipeline so per-rule detections from the guardrail
+	// proxy land on every observability surface (scan_findings DB
+	// rows, EventScan + EventScanFinding JSONL lines,
+	// defenseclaw_scan_findings_by_rule_total, sliding-window
+	// correlator). The resulting evaluation_id + top rule_ids are
+	// stamped onto the verdict so downstream notifier / webhook /
+	// block-notification paths can carry them too. The emission is
+	// skipped when an upstream caller (inspectToolCalls) already
+	// produced the IDs — that prevents double-emit of the same
+	// rule findings.
+	if verdict.EvaluationID == "" {
+		eval := p.emitGuardrailScanVerdictFindings(
+			ctx,
+			recordTelemetryScannerEnum(direction, verdict, elapsed),
+			recordTelemetryTarget(direction, model),
+			recordTelemetryTargetType(direction),
+			verdict,
+			elapsed,
+			"emit_proxy_findings",
+		)
+		if eval.EvaluationID != "" {
+			verdict.EvaluationID = eval.EvaluationID
+		}
+		if len(eval.RuleIDs) > 0 {
+			verdict.RuleIDs = eval.RuleIDs
+		}
+	}
+	if verdict.EvaluationID != "" {
+		details += fmt.Sprintf(" evaluation_id=%s", verdict.EvaluationID)
+	}
+	if len(verdict.RuleIDs) > 0 {
+		details += fmt.Sprintf(" rule_ids=%s", strings.Join(verdict.RuleIDs, ","))
+	}
+
 	if requestID != "" {
 		// Append the correlation key so the human-readable gateway.log
 		// line (which skips structured sinks) is still searchable by
@@ -3770,6 +3873,20 @@ func (p *GuardrailProxy) recordTelemetry(ctx context.Context, direction, model s
 		details += fmt.Sprintf(" request_id=%s", requestID)
 	}
 	details = appendRawTelemetryFields(details, rawFields...)
+
+	// Stamp the proxy's connector onto the request envelope so every
+	// ctx-aware audit write below (the LogActionCtx verdict row and the
+	// ApplyEnvelope store twin) carries connector attribution. MergeEnvelope
+	// preserves all the dimensions the CorrelationMiddleware already
+	// stamped and only fills in the connector. Without this the
+	// LogActionCtx verdict row reached SQLite/sinks with an empty
+	// connector in a multi-connector install.
+	if name := p.connectorName(); name != "" {
+		ctx = audit.ContextWithEnvelope(ctx, audit.MergeEnvelope(
+			audit.CorrelationEnvelope{Connector: name},
+			audit.EnvelopeFromContext(ctx),
+		))
+	}
 
 	if p.logger != nil {
 		// v7: route the verdict audit row through the context-aware
@@ -3781,7 +3898,7 @@ func (p *GuardrailProxy) recordTelemetry(ctx context.Context, direction, model s
 		// used to be silently dropped on the SQLite row even when
 		// the matching gateway.jsonl row had them. See review
 		// finding C1 for the coverage-gap writeup.
-		_ = p.logger.LogActionCtx(ctx, "guardrail-verdict", model, details)
+		_ = p.logger.LogActionCtx(ctx, string(audit.ActionGuardrailVerdict), model, details)
 	}
 	if p.store != nil {
 		// guardrail-inspection is the SQLite-only twin row the
@@ -3804,27 +3921,29 @@ func (p *GuardrailProxy) recordTelemetry(ctx context.Context, direction, model s
 		// unredacted form to whichever forwarder reads from
 		// audit.Store.
 		evt := audit.Event{
-			Action:    "guardrail-inspection",
+			Action:    string(audit.ActionGuardrailInspection),
 			Target:    model,
 			Severity:  verdict.Severity,
 			Details:   redaction.ForSinkReason(details),
 			Timestamp: time.Now().UTC(),
 			RequestID: requestID,
+			Connector: p.connectorName(),
 		}
 		audit.ApplyEnvelope(&evt, audit.EnvelopeFromContext(ctx))
 		_ = p.store.LogEvent(evt)
 	}
 
 	if p.logger != nil {
-		_ = p.logger.LogActionWithCorrelation("guardrail-verdict", model, details, "", requestID)
+		_ = p.logger.LogActionWithCorrelationConnector(string(audit.ActionGuardrailVerdict), model, details, "", requestID, p.connectorName())
 	}
 	_ = persistAuditEvent(p.logger, p.store, audit.Event{
-		Action:    "guardrail-inspection",
+		Action:    string(audit.ActionGuardrailInspection),
 		Target:    model,
 		Severity:  verdict.Severity,
 		Details:   details,
 		Timestamp: time.Now().UTC(),
 		RequestID: requestID,
+		Connector: p.connectorName(),
 	})
 
 	if p.otel != nil {
@@ -3849,11 +3968,12 @@ func (p *GuardrailProxy) recordTelemetry(ctx context.Context, direction, model s
 		event := audit.Event{
 			ID:        uuid.New().String(),
 			Timestamp: time.Now().UTC(),
-			Action:    "guardrail-block",
+			Action:    string(audit.ActionGuardrailBlock),
 			Target:    model,
 			Actor:     "defenseclaw-guardrail",
 			Details:   details,
 			Severity:  verdict.Severity,
+			Connector: p.connectorName(),
 		}
 		// v7: webhook payloads are one of the five external-facing
 		// surfaces; Splunk/PagerDuty/Slack consumers pivot on the same
@@ -4212,7 +4332,7 @@ func (p *GuardrailProxy) inspectToolCalls(ctx context.Context, toolCallsJSON jso
 	if err := json.Unmarshal(toolCallsJSON, &toolCalls); err != nil {
 		fmt.Fprintf(os.Stderr, "[guardrail] TOOL-CALL-INSPECT parse error (blocking): %v\n", err)
 		if p.logger != nil {
-			_ = p.logger.LogActionCtx(ctx, "guardrail-tool-call-parse-error", "", err.Error())
+			_ = p.logger.LogActionCtx(ctx, string(audit.ActionGuardrailToolCallParseError), "", err.Error())
 		}
 		return &ScanVerdict{
 			Action:         "block",
@@ -4257,10 +4377,26 @@ func (p *GuardrailProxy) inspectToolCalls(ctx context.Context, toolCallsJSON jso
 	fmt.Fprintf(os.Stderr, "[guardrail] TOOL-CALL-INSPECT action=%s severity=%s findings=%d reason=%s\n",
 		action, severity, len(allFindings), strings.Join(top, ", "))
 
+	// Fan the structured per-rule findings through the unified
+	// scan_findings pipeline before stamping the audit row, so the
+	// `evaluation_id=` + `rule_ids=` correlation suffix can join
+	// the audit row to the EventScanFinding rows it produced.
+	// inspectToolCalls already has the full []RuleFinding (severity
+	// + confidence + evidence + tags per match) so we adapt them
+	// directly rather than re-deriving from NormalizeScanVerdict.
+	eval := p.emitToolCallInspectFindings(ctx, allFindings, action)
+	auditDetails := fmt.Sprintf("action=%s severity=%s confidence=%.2f", action, severity, confidence)
+	auditDetails = appendHookEvaluationDetails(auditDetails, eval)
+
 	if p.logger != nil {
 		for _, tc := range toolCalls {
-			_ = p.logger.LogActionCtx(ctx, "guardrail-tool-call-inspect", tc.Function.Name,
-				fmt.Sprintf("action=%s severity=%s confidence=%.2f", action, severity, confidence))
+			// Use the typed audit.ActionGuardrailToolCallInspect
+			// constant (rather than the string literal) for the
+			// row's action column, AND carry the evaluation_id +
+			// rule_ids in the details string so the unified-pipeline
+			// join key reaches SIEM without breaking the column-
+			// indexed action enum.
+			_ = p.logger.LogActionCtx(ctx, string(audit.ActionGuardrailToolCallInspect), tc.Function.Name, auditDetails)
 		}
 	}
 
@@ -4274,6 +4410,8 @@ func (p *GuardrailProxy) inspectToolCalls(ctx context.Context, toolCallsJSON jso
 		Reason:         strings.Join(top, ", "),
 		Findings:       FindingStrings(allFindings),
 		ScannerSources: []string{"tool-call-inspect"},
+		EvaluationID:   eval.EvaluationID,
+		RuleIDs:        eval.RuleIDs,
 	}
 }
 
