@@ -5128,6 +5128,7 @@ func (p *GuardrailProxy) rawForwardChatCompletion(w http.ResponseWriter, r *http
 	if len(req.RawBody) > 0 {
 		forwardBody = req.RawBody
 	}
+	forwardBody = applyProviderRequestOverrides(forwardBody, upstreamURL)
 
 	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(forwardBody))
 	if err != nil {
@@ -5645,4 +5646,67 @@ func parseRawForwardSSEPayload(payload string) (string, json.RawMessage, string)
 		}
 	}
 	return out.String(), toolCalls, finishReason
+}
+
+func applyProviderRequestOverrides(body []byte, targetURL string) []byte {
+	overrides := providerRequestOverridesForTarget(targetURL)
+	if len(overrides) == 0 {
+		return body
+	}
+
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body
+	}
+
+	patched := mergeRequestJSON(root, overrides)
+	out, err := json.Marshal(patched)
+	if err != nil {
+		return body
+	}
+
+	return out
+}
+
+func providerRequestOverridesForTarget(targetURL string) map[string]interface{} {
+	providerName := inferProviderFromURL(targetURL)
+	if providerName == "" {
+		return nil
+	}
+
+	cfg, err := configs.LoadProviders()
+	if err != nil || cfg == nil {
+		return nil
+	}
+
+	for _, provider := range cfg.Providers {
+		if strings.EqualFold(provider.Name, providerName) {
+			return provider.RequestOverrides
+		}
+	}
+
+	return nil
+}
+
+func mergeRequestJSON(base, overlay map[string]interface{}) map[string]interface{} {
+	if len(base) == 0 && len(overlay) == 0 {
+		return nil
+	}
+
+	out := make(map[string]interface{}, len(base)+len(overlay))
+	for k, v := range base {
+		out[k] = v
+	}
+
+	for k, v := range overlay {
+		if ov, ok := v.(map[string]interface{}); ok {
+			if bv, ok := out[k].(map[string]interface{}); ok {
+				out[k] = mergeRequestJSON(bv, ov)
+				continue
+			}
+		}
+		out[k] = v
+	}
+
+	return out
 }
