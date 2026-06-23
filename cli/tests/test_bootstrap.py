@@ -29,7 +29,9 @@ from defenseclaw.config import (
     Config,
     GatewayConfig,
     GuardrailConfig,
+    HILTConfig,
     OpenShellConfig,
+    PerConnectorGuardrailConfig,
 )
 
 
@@ -170,6 +172,52 @@ class ApplyFirstRunChoicesHookFailModeTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _apply_first_run_choices: judge setup
+#
+# ``init`` and ``quickstart`` expose a single "enable judge" choice. When
+# selected, that choice must be effective for hook connectors without asking
+# for a second coverage list.
+# ---------------------------------------------------------------------------
+
+
+class ApplyFirstRunChoicesJudgeTests(unittest.TestCase):
+    def setUp(self):
+        from defenseclaw.config import default_config
+        self.cfg = default_config()
+
+    def _apply(self, *, with_judge: bool) -> None:
+        from defenseclaw.bootstrap import (
+            FirstRunOptions,
+            _apply_first_run_choices,
+        )
+
+        opts = FirstRunOptions(connector="codex", profile="observe", with_judge=with_judge)
+        _apply_first_run_choices(self.cfg, opts, "codex", "observe", "local")
+
+    def test_with_judge_enables_all_hook_coverage(self):
+        self._apply(with_judge=True)
+        self.assertTrue(self.cfg.guardrail.judge.enabled)
+        self.assertEqual(self.cfg.guardrail.detection_strategy, "regex_judge")
+        self.assertEqual(self.cfg.guardrail.judge.hook_connectors, ["*"])
+
+    def test_with_judge_bumps_regex_only_strategy(self):
+        self.cfg.guardrail.detection_strategy = "regex_only"
+        self._apply(with_judge=True)
+        self.assertEqual(self.cfg.guardrail.detection_strategy, "regex_judge")
+        self.assertEqual(self.cfg.guardrail.judge.hook_connectors, ["*"])
+
+    def test_first_run_choice_clears_stale_multi_connector_map(self):
+        self.cfg.guardrail.connectors = {
+            "codex": PerConnectorGuardrailConfig(),
+            "hermes": PerConnectorGuardrailConfig(),
+        }
+        self._apply(with_judge=False)
+        self.assertEqual(sorted(self.cfg.guardrail.connectors), ["codex"])
+        self.assertNotIn("hermes", self.cfg.guardrail.connectors)
+        self.assertEqual(self.cfg.active_connectors(), ["codex"])
+
+
+# ---------------------------------------------------------------------------
 # _apply_first_run_choices: HITL (Human-In-the-Loop) plumbing
 #
 # These pin the contract that ``defenseclaw init`` / ``quickstart`` rely
@@ -206,6 +254,7 @@ class ApplyFirstRunChoicesHITLTests(unittest.TestCase):
     def _apply(
         self,
         *,
+        connector: str = "codex",
         human_approval: bool | None = None,
         hilt_min_severity: str = "",
     ) -> None:
@@ -215,12 +264,12 @@ class ApplyFirstRunChoicesHITLTests(unittest.TestCase):
         )
 
         opts = FirstRunOptions(
-            connector="codex",
+            connector=connector,
             profile="action",
             human_approval=human_approval,
             hilt_min_severity=hilt_min_severity,
         )
-        _apply_first_run_choices(self.cfg, opts, "codex", "action", "local")
+        _apply_first_run_choices(self.cfg, opts, connector, "action", "local")
 
     def test_none_preserves_existing_enabled(self):
         self.cfg.guardrail.hilt.enabled = True
@@ -292,6 +341,40 @@ class ApplyFirstRunChoicesHITLTests(unittest.TestCase):
         self._apply(human_approval=False, hilt_min_severity="MEDIUM")
         self.assertFalse(self.cfg.guardrail.hilt.enabled)
         self.assertEqual(self.cfg.guardrail.hilt.min_severity, "MEDIUM")
+
+    def test_explicit_choice_updates_selected_connector_hilt_override(self):
+        self.cfg.guardrail.connectors = {
+            "codex": PerConnectorGuardrailConfig(
+                hilt=HILTConfig(enabled=True, min_severity="LOW")
+            ),
+            "hermes": PerConnectorGuardrailConfig(
+                hilt=HILTConfig(enabled=False, min_severity="HIGH")
+            ),
+        }
+        self.cfg.guardrail.hilt.enabled = False
+
+        self._apply(connector="hermes", human_approval=True)
+
+        self.assertEqual(sorted(self.cfg.guardrail.connectors), ["hermes"])
+        hermes_hilt = self.cfg.guardrail.connectors["hermes"].hilt
+        self.assertIsNotNone(hermes_hilt)
+        self.assertTrue(hermes_hilt.enabled)
+        self.assertEqual(hermes_hilt.min_severity, "HIGH")
+        self.assertTrue(self.cfg.guardrail.effective_hilt("hermes").enabled)
+
+    def test_explicit_false_updates_selected_connector_hilt_override(self):
+        self.cfg.guardrail.connectors = {
+            "hermes": PerConnectorGuardrailConfig(
+                hilt=HILTConfig(enabled=True, min_severity="MEDIUM")
+            ),
+        }
+
+        self._apply(connector="hermes", human_approval=False)
+
+        hermes_hilt = self.cfg.guardrail.connectors["hermes"].hilt
+        self.assertIsNotNone(hermes_hilt)
+        self.assertFalse(hermes_hilt.enabled)
+        self.assertEqual(hermes_hilt.min_severity, "MEDIUM")
 
 
 # ---------------------------------------------------------------------------

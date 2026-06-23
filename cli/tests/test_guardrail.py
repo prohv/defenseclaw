@@ -25,6 +25,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import yaml
@@ -1012,24 +1013,69 @@ class TestSetupGuardrailCommand(unittest.TestCase):
     def test_non_interactive_claudecode_action_enables_enforcement(self):
         from defenseclaw.commands.cmd_setup import setup
         self.app.cfg.claw.home_dir = self.tmp_dir
-
-        result = self.runner.invoke(
-            setup,
-            [
-                "guardrail",
-                "--non-interactive",
-                "--connector",
-                "claudecode",
-                "--mode",
-                "action",
-                "--no-restart",
-            ],
-            obj=self.app,
+        signal = SimpleNamespace(
+            version="2.1.160 (Claude Code)",
+            installed=True,
+            error="",
+            binary_path="/usr/bin/claude",
         )
+        disc = SimpleNamespace(agents={"claudecode": signal})
+
+        with patch(
+            "defenseclaw.commands.cmd_setup.agent_discovery.discover_agents",
+            return_value=disc,
+        ):
+            result = self.runner.invoke(
+                setup,
+                [
+                    "guardrail",
+                    "--non-interactive",
+                    "--connector",
+                    "claudecode",
+                    "--mode",
+                    "action",
+                    "--no-restart",
+                ],
+                obj=self.app,
+            )
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(self.app.cfg.guardrail.connector, "claudecode")
         self.assertEqual(self.app.cfg.guardrail.mode, "action")
+
+    def test_non_interactive_missing_action_connector_downgrades_to_observe(self):
+        from defenseclaw.commands.cmd_setup import setup
+
+        self.app.cfg.claw.home_dir = self.tmp_dir
+        signal = SimpleNamespace(version="", installed=False, error="", binary_path="")
+        disc = SimpleNamespace(agents={"copilot": signal})
+
+        with patch(
+            "defenseclaw.commands.cmd_setup.agent_discovery.discover_agents",
+            return_value=disc,
+        ), patch(
+            "defenseclaw.commands.cmd_setup.execute_guardrail_setup",
+            return_value=(True, []),
+        ):
+            result = self.runner.invoke(
+                setup,
+                [
+                    "guardrail",
+                    "--non-interactive",
+                    "--connector",
+                    "copilot",
+                    "--mode",
+                    "action",
+                    "--no-restart",
+                ],
+                obj=self.app,
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("GitHub Copilot CLI: connector was not detected locally", result.output)
+        self.assertIn("GitHub Copilot CLI: requested action mode was refused", result.output)
+        self.assertEqual(self.app.cfg.guardrail.connector, "copilot")
+        self.assertEqual(self.app.cfg.guardrail.mode, "observe")
 
     def test_non_interactive_codex_observe_flag_enables_enforcement(self):
         from defenseclaw.commands.cmd_setup import setup
@@ -1518,7 +1564,7 @@ class TestSetupGuardrailCommand(unittest.TestCase):
         ), patch(
             "defenseclaw.commands.cmd_setup._check_connector_version_supported_for_setup",
             return_value=True,
-        ):
+        ) as version_check:
             result = self.runner.invoke(
                 setup,
                 ["guardrail", "--no-restart"],
@@ -1550,7 +1596,7 @@ class TestSetupGuardrailCommand(unittest.TestCase):
         ), patch(
             "defenseclaw.commands.cmd_setup._check_connector_version_supported_for_setup",
             return_value=True,
-        ):
+        ) as version_check:
             result = self.runner.invoke(
                 setup,
                 ["guardrail", "--no-restart"],
@@ -1571,10 +1617,10 @@ class TestSetupGuardrailCommand(unittest.TestCase):
             "Per-connector enforcement mode is managed via", result.output
         )
 
-    def test_interactive_multi_connector_skips_picker_and_mode(self):
-        """Two configured connectors: BOTH the picker and the singular
-        observe/action prompt are skipped — a single answer can't express
-        per-connector intent. The wizard still runs all GLOBAL steps."""
+    def test_interactive_multi_connector_uses_per_connector_mode_picker(self):
+        """Two configured connectors: the connector picker and singular
+        observe/action prompt are skipped, but the wizard offers a
+        per-connector action picker before the global policy steps."""
         from defenseclaw.commands.cmd_setup import setup
         from defenseclaw.config import PerConnectorGuardrailConfig
 
@@ -1593,7 +1639,7 @@ class TestSetupGuardrailCommand(unittest.TestCase):
         ), patch(
             "defenseclaw.commands.cmd_setup._check_connector_version_supported_for_setup",
             return_value=True,
-        ):
+        ) as version_check:
             result = self.runner.invoke(
                 setup,
                 ["guardrail", "--no-restart"],
@@ -1613,14 +1659,58 @@ class TestSetupGuardrailCommand(unittest.TestCase):
         self.assertIn(
             "Per-connector enforcement mode is managed via", result.output
         )
-        # The singular enforcement-mode prompt is skipped...
-        self.assertIn("Enforcement mode is per-connector here", result.output)
+        # The singular enforcement-mode prompt is skipped in favor of the
+        # per-connector action picker.
+        self.assertIn("Select connector(s) for action enforcement.", result.output)
         self.assertNotIn("Select mode", result.output)
-        # ...and per-connector modes are left untouched.
+        # Pressing Enter accepts the current per-connector defaults.
         self.assertEqual(self.app.cfg.guardrail.connectors["codex"].mode, "action")
         self.assertEqual(
             self.app.cfg.guardrail.connectors["claudecode"].mode, "observe"
         )
+        checked = {call.args[0] for call in version_check.call_args_list}
+        self.assertEqual(checked, {"codex", "claudecode"})
+
+    def test_interactive_multi_connector_downgrades_refused_action_mode(self):
+        """Action connectors refused by setup guardrail validation fall back
+        to observe so status reflects effective posture after the run."""
+        from defenseclaw.commands.cmd_setup import setup
+        from defenseclaw.config import PerConnectorGuardrailConfig
+
+        self.app.cfg.claw.home_dir = self.tmp_dir
+        gc = self.app.cfg.guardrail
+        gc.enabled = True
+        gc.connector = "cursor"
+        gc.connectors = {
+            "cursor": PerConnectorGuardrailConfig(mode="action"),
+            "claudecode": PerConnectorGuardrailConfig(mode="action"),
+        }
+
+        def version_gate(connector, *, mode="observe", **_kwargs):
+            return not (connector == "cursor" and mode == "action")
+
+        with patch(
+            "defenseclaw.commands.cmd_setup.execute_guardrail_setup",
+            return_value=(True, []),
+        ) as execute_setup, patch(
+            "defenseclaw.commands.cmd_setup._check_connector_version_supported_for_setup",
+            side_effect=version_gate,
+        ):
+            result = self.runner.invoke(
+                setup,
+                ["guardrail", "--no-restart"],
+                obj=self.app,
+                input="\n" * 15,
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(
+            "Cursor: requested action mode was refused; configuring observe mode instead.",
+            result.output,
+        )
+        execute_setup.assert_called_once()
+        self.assertEqual(gc.connectors["cursor"].mode, "observe")
+        self.assertEqual(gc.connectors["claudecode"].mode, "action")
 
     def test_interactive_multi_connector_offers_hilt_when_any_action(self):
         """In multi-connector mode HILT is gated on whether ANY connector

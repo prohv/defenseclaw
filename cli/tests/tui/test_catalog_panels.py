@@ -21,12 +21,19 @@ from defenseclaw.config import AssetPolicyRule
 from defenseclaw.tui.panels.mcps import MCPsPanelModel, mcp_actions, mcp_unset_target_for_connector
 from defenseclaw.tui.panels.plugins import PluginRow, PluginsPanelModel, plugin_actions
 from defenseclaw.tui.panels.skills import SkillRow, SkillsPanelModel, registry_attribution_from_rules, skill_actions
-from defenseclaw.tui.panels.tools import ToolRow, ToolsPanelModel, split_tool_target, tool_actions
+from defenseclaw.tui.panels.tools import (
+    ToolRow,
+    ToolsPanelModel,
+    parse_tool_list_json,
+    split_tool_target,
+    tool_actions,
+)
 from defenseclaw.tui.services.catalog_state import (
     connector_source_label,
     friendly_connector_name,
     parse_mcp_list_json,
     parse_plugin_list_json,
+    parse_skill_list_json,
     skill_list_to_row,
 )
 from rich.text import Text
@@ -176,6 +183,7 @@ def test_mcp_parse_filter_actions_and_registry_focus() -> None:
             [
                 {
                     "name": "context7",
+                    "connector": "antigravity",
                     "transport": "stdio",
                     "command": "uvx",
                     "url": "https://example.invalid/mcp",
@@ -188,6 +196,7 @@ def test_mcp_parse_filter_actions_and_registry_focus() -> None:
         )
     )
     assert rows[0].status == "allowed"
+    assert rows[0].connector == "antigravity"
     assert rows[0].url == "context7"
     assert rows[0].server_url == "https://example.invalid/mcp"
     assert rows[1].status == "blocked"
@@ -206,6 +215,23 @@ def test_mcp_parse_filter_actions_and_registry_focus() -> None:
     assert panel.handle_key("n").open_mcp_set_form is True
     assert panel.handle_key("+").open_mcp_set_form is True
     assert panel.handle_key("u").intent.args == ("mcp", "unblock", "filesystem")
+
+
+def test_mcp_parse_scoped_group_and_empty_group() -> None:
+    scoped = parse_mcp_list_json(
+        json.dumps(
+            {
+                "connector": "claudecode",
+                "mcp_servers": [
+                    {"name": "ctx7", "transport": "stdio", "command": "uvx"},
+                ],
+            }
+        )
+    )
+    assert scoped[0].name == "ctx7"
+    assert scoped[0].connector == "claudecode"
+
+    assert parse_mcp_list_json(json.dumps({"connector": "claudecode", "mcp_servers": []})) == ()
 
 
 def test_mcp_actions_name_connector_specific_unset_targets() -> None:
@@ -400,6 +426,75 @@ def test_tools_connector_filter_shows_selected_connector_plus_global_fallback() 
     ]
 
 
+def test_tool_parse_scoped_group_and_flat_list() -> None:
+    rows = parse_tool_list_json(
+        json.dumps(
+            {
+                "connector": "hermes",
+                "tools": [
+                    {
+                        "name": "search",
+                        "connector": "hermes",
+                        "scope": "connector",
+                        "status": "block",
+                        "reason": "scoped",
+                        "updated_at": "2026-04-18T11:12:13",
+                    },
+                    {
+                        "name": "read_file",
+                        "connector": "hermes",
+                        "scope": "global",
+                        "status": "allow",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert rows[0] == ToolRow(
+        name="search",
+        scope="connector",
+        status="blocked",
+        reason="scoped",
+        time="2026-04-18 11:12",
+        target_name="@hermes/search",
+        connector="hermes",
+    )
+    assert rows[1].connector == "hermes"
+    assert rows[1].display_scope == "global"
+    assert rows[1].status == "allowed"
+
+    flat = parse_tool_list_json(
+        json.dumps(
+            [
+                {
+                    "name": "filesystem/write_file",
+                    "scope": "source",
+                    "status": "block",
+                }
+            ]
+        )
+    )
+    assert flat[0].name == "write_file"
+    assert flat[0].scope == "filesystem"
+    assert flat[0].connector == ""
+
+
+def test_tools_load_intent_uses_json_and_connector_focus() -> None:
+    panel = ToolsPanelModel(connector="codex")
+
+    assert panel.load_intent().args == ("tool", "list", "--json")
+
+    panel.connector_focus_enabled = True
+    assert panel.load_intent().args == (
+        "tool",
+        "list",
+        "--json",
+        "--connector",
+        "codex",
+    )
+
+
 def test_tools_actions_use_selected_connector_filter_for_policy_mutations() -> None:
     panel = ToolsPanelModel(
         FakeToolStore(
@@ -551,6 +646,27 @@ def test_skill_list_to_row_parses_severity_counts() -> None:
     )
 
     assert row.severity_counts == {"critical": 1, "high": 2, "low": 3}
+
+
+def test_skill_parse_scoped_group_and_empty_group() -> None:
+    rows = parse_skill_list_json(
+        json.dumps(
+            {
+                "connector": "codex",
+                "skills": [
+                    {
+                        "name": "alpha",
+                        "eligible": True,
+                        "status": "active",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert rows[0].name == "alpha"
+    assert rows[0].connector == "codex"
+    assert parse_skill_list_json(json.dumps({"connector": "codex", "skills": []})) == ()
 
 
 def test_skill_list_to_row_without_severity_counts_is_empty() -> None:
